@@ -58,9 +58,9 @@ npm run dev
 
 ---
 
-## 🧠 Agent Architecture
+## 🧠 Multi-Agent Architecture
 
-Baitrage is built on a concurrent, multi-layered architecture designed to separate high-frequency local ingestion from deep, asynchronous AI synthesis.
+Baitrage is powered by a concurrent, multi-agent architecture designed to separate high-frequency multimodal observation from deep, asynchronous code synthesis. Instead of relying on a single monolithic LLM call, Baitrage delegates tasks to a swarm of specialized agents.
 
 ```mermaid
 graph TD
@@ -73,7 +73,7 @@ graph TD
     end
 
     %% Intelligence Layer
-    subgraph Intelligence["2. Content-Based Intelligence (Gemini Flash)"]
+    subgraph Intelligence["2. The Observer Agent (Gemini Flash)"]
         Analyze["/api/analyze Endpoint"]
         Mic -->|Live Transcript| Analyze
         Cam -->|Facial Affect| Analyze
@@ -84,7 +84,7 @@ graph TD
     end
 
     %% Orchestrator Layer
-    subgraph Orchestration["3. Agent Orchestrator (Gemini Pro)"]
+    subgraph Orchestration["3. The Intervention Swarm (Gemini Pro)"]
         Sentinel["Rage Sentinel"]
         Miner["Intent Miner"]
         Scout["Symbol Scout"]
@@ -102,20 +102,17 @@ graph TD
     Architect -->|Optimized Prompt & Advice| UI
 ```
 
-### 1. Ingestion Layer
-- **Media Streams**: `useMultimodal.ts` captures browser-native MediaStreams. Audio volume is isolated purely for UI rendering.
-- **Codebase Watcher**: A local background process uses `chokidar` to monitor the workspace. It parses files to build a lightweight abstract syntax tree (`symbol-map.json`) containing function signatures, types, and variables, ensuring the AI context window isn't bloated with raw, uncompressed files. Updates are pushed to the UI via zero-polling Server-Sent Events (SSE).
+### 1. The Observer Agent (Gemini Flash)
+- **Role**: High-frequency multimodal state evaluator.
+- **Function**: Every 5 seconds, this fast-inference agent processes an aggregated batch of live transcripts, camera frames, and screen context. Its sole responsibility is **Affective Scoring**. It evaluates the true emotional state based on *content* (e.g., cursing, exasperated phrasing) and *micro-expressions*, actively decoupling frustration detection from raw volume to prevent false positives.
 
-### 2. Intelligence Layer
-- **Content-Aware Observation**: Every 5 seconds, an aggregated batch of transcripts and screen/camera frames is sent to Gemini Flash.
-- **Affective Scoring**: Gemini Flash evaluates the true emotional state based on *content* (e.g. cursing, exasperated phrasing) and *micro-expressions*, decoupling frustration detection from raw volume (preventing loud but normal speech from triggering false positives).
+### 2. The Intervention Swarm (Gemini Pro)
+When the `Frustration Evaluator` circuit breaker trips (> 0.35 threshold), the concurrent `agent-orchestrator.ts` spawns a swarm of specialized agents to execute the pivot strategy:
 
-### 3. Orchestrator Layer
-When the `Frustration Evaluator` circuit breaker trips, the concurrent `agent-orchestrator.ts` runs:
-1. **Rage Sentinel**: Makes a deterministic local decision on whether to intervene based on the ledger history.
-2. **Intent Miner**: Infers the developer's current task and failure mode from the transcript and screen grounding.
-3. **Symbol Scout**: Pulls the exact required signatures from the local `symbol-map.json`.
-4. **Prompt Architect**: Uses Gemini Pro to synthesize the final, highly structured "Optimized Prompt" designed to de-escalate the developer and solve the code problem.
+1. **Rage Sentinel (Gatekeeper)**: Makes a deterministic local decision on whether to intervene based on the ledger history, preventing intervention spam.
+2. **Intent Miner (Analyst)**: Analyzes the transcript and screen grounding to infer the developer's exact current task, blocking issue, and failure mode.
+3. **Symbol Scout (Context Fetcher)**: A Retrieval-Augmented Generation (RAG) agent that parses the local `symbol-map.json` (built via Chokidar) to pull only the relevant function signatures, types, and variables needed to solve the issue.
+4. **Prompt Architect (Synthesizer)**: The final heavy-lifter. It combines the Intent Miner's task analysis with the Symbol Scout's codebase context to engineer a highly structured, cool-headed "Optimized Prompt". This prompt is designed to be pasted directly into the developer's IDE or AI coding assistant to break the error loop.
 
 <div align="center">
   <br />
