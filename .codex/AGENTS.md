@@ -100,3 +100,55 @@ Since Codex lacks hooks, security enforcement is instruction-based:
 3. Run `npm audit` / `pip audit` before committing
 4. Review `git diff` before every push
 5. Use `sandbox_mode = "workspace-write"` in config
+
+
+## Hackathon Specifications
+Hi everyone,
+
+We have updated the prize and sponsor credit list for the AI Engineer Hackathon. Here is the current complete list.
+
+Main overall prizes
+
+1st place: $3,000 SGD cash + AIE ticket + 15k OpenAI API credits + $100k Cloudflare credits
+
+2nd place: $2,000 SGD cash + AIE ticket + 10k OpenAI API credits + $50k Cloudflare credits
+
+3rd place: $1,000 SGD cash + AIE ticket + 5k OpenAI API credits + $25k Cloudflare credits
+
+Track prizes
+
+OpenAI/Codex Best use of GPT-5.5: 1-year ChatGPT Pro/Codex for the top 2 teams Best use of GPT Image 2: 1-year ChatGPT Pro/Codex for the top 2 teams
+
+Adaption Labs 1st: US$1,500 cash + 1.5k credits 2nd: US$1,000 cash + 1k credits 3rd: US$500 cash + 500 credits
+
+Gemini Best Gen Media Track: $2.5k in Gemini credits. Use Lyria, Veo 3 and more. Best Voice Agent Track: $2.5k in Gemini credits. Use the Gemini flash-3.1-live model.
+
+Convex Best use of Convex: $500 gift cards for the 1st and 2nd place teams.
+
+Cursor Best use of Cursor SDK: Cursor Ultra for one year.
+
+Fal Best use of Fal: $1,000 in Fal credits.
+
+Credits for all participants
+
+Gemini: $25 in credits per participant.
+
+Vercel: $30 credits per participant.
+
+Adaption Labs: 150 credits per confirmed participant.
+
+Daytona: $100 in Daytona credits per participant.
+
+Fal: $25 in Fal credits for participants.
+
+Hyperspell: credits for all 300 builders, codes to be set up.
+
+ElevenLabs: 100k free credits each, equivalent to 1 month of the Creator plan.
+
+OpenAI/Codex: 1-month participant coupon codes, final allocation details coming soon.
+
+More sponsor credits and track details may be announced as they are finalized.
+
+See you Saturday, Sherry
+
+## END

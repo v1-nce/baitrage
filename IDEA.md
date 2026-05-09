@@ -1,1 +1,121 @@
-Project Blueprint: BaitrageIdea Name:Baitrage – A Multimodal De-escalation & Prompt Optimization Widget.Target Audience:Developers and AI Engineers who fall into "Rage-Refactoring" cycles—where repetitive LLM failures lead to increasingly poor prompt quality and cognitive burnout.The Pain Point:The Frustration Feedback Loop. When a prompt fails, the human response is often to "rage-prompt" (shorter, more aggressive, less descriptive inputs). This causes the AI to fail further. Current IDEs are "blind" to the developer's physical state, ignoring the jaw clenching, vocal strain, and rapid typing that signal a total loss of productivity.Evidence and Statistics:The 70/30 Trap: Developers spend the majority of their time on "plumbing" and fixing hallucinations.Prompt Degradation: Physiological stress directly correlates with a decrease in the ability to articulate complex hierarchical logic, leading to "junk prompts."Competitors and Market:Cursor/Copilot: Passive autocompleters. They don't care if you're angry; they just wait for the next (potentially bad) input.Hume AI: Great at detection, but lacks the coding context and codebase indexing to actually solve the technical problem.The Solution:Baitrage is a lightweight widget that sits on your desktop, acting as a "Biological Circuit Breaker." It uses your camera and mic to detect the onset of rage and intercepts your workflow to suggest a mathematically superior, codebase-aware prompt.Core Features & AI Orchestration1. The Mirror Widget (The Observer)A small, semi-transparent "Picture-in-Picture" window.Function: Displays the real-time feed of what the AI "sees" (facial keypoints) and "hears" (vocal waveforms).Psychological Effect: The "Mirror Effect" often helps humans self-regulate their emotions simply by seeing their own frustration reflected.2. The Agentic Seer (The Brain)The heavy-lifting engine that runs in the background.Input: Real-time stream of Video + Audio + Last 5 Prompts + Codebase Context.Logic: Uses Gemini 3.1 Flash-Live to calculate a Frustration Coefficient ($F$).$$F = (v_{strain} \times 0.4) + (f_{micro-expressions} \times 0.4) + (p_{looping} \times 0.2)$$Retrieval: If $F > 0.7$, it queries the indexed codebase and prompt history to find why the previous approach failed.3. The Prompt Pivot UI (The Redirection)A non-intrusive UI overlay that appears when you are about to send a "rage prompt."Action: It intercepts the Cmd+Enter or Click and presents a "Better Way."Content: A structured, calm, and highly optimized prompt that incorporates the specific codebase context the user was too frustrated to remember.Hackathon Track AlignmentTo win the tracks, we will distribute the logic across the sponsor APIs:ResourceImplementation in BaitrageTrack TargetGemini Flash-3.1-LiveMultimodal websocket for real-time video/audio affective sensing.Best Voice Agent TrackConvexReal-time storage of prompt history and "Rage Logs" for session analysis.Best use of ConvexDaytonaEvery suggested prompt is "pre-tested" in a Daytona sandbox to ensure it works before being shown.Daytona CreditsVercelHosting the Next.js widget and the "Seer" API.Vercel CreditsCursor SDKUsed to index the local codebase and pull relevant file snippets into the suggested prompt.Best use of Cursor SDKHigh-Level Implementation Plan (The 6-Hour Sprint)Phase 1: The Sensor (Hour 1-2)Spin up a Next.js app.Connect to the Gemini 3.1 Flash-Live websocket.Set up the webcam and mic stream. Prompt Gemini to output a JSON stream of "User Frustration Level" (0-1).Phase 2: The Context (Hour 3)Use Convex to subscribe to the "last_prompts" table.Integrate a basic file-walker to index the current src/ directory.Phase 3: The Interceptor (Hour 4-5)Create the "Mirror Widget" UI.Implement the logic: IF frustration > 0.7 AND typing_speed > threshold THEN show_suggestion().Use a separate Gemini Pro call to synthesize the "Optimal Prompt" based on the failed history.Phase 4: The Validation (Hour 6)Trigger a Daytona sandbox in the background to verify the suggested prompt's logic.Polish the UI with "Calm" aesthetics (minimalist, soft blues/greens).Why Baitrage WinsIt is the only tool that acknowledges that the developer is part of the system. By treating "User Rage" as a technical bug that can be indexed and refactored, you are creating a new category of developer tool: The Affective IDE.
+# Baitrage Product Blueprint
+
+## Name
+
+Baitrage is a local-first affective developer dashboard for interrupting rage-prompting loops.
+
+## Target User
+
+Developers and AI engineers using Claude, ChatGPT, Cursor, Copilot, or other AI tools who hit repetitive failure loops and begin sending shorter, lower-context prompts.
+
+## Core Problem
+
+When an AI coding session fails repeatedly, the developer often removes context instead of adding it. Baitrage treats that frustration loop as an observable system state: facial affect, vocal strain, visible chat history, and current codebase changes all become telemetry for a prompt-recalibration layer.
+
+## Local-First Demo Strategy
+
+Baitrage should be usable after:
+
+```bash
+git clone <repo>
+npm install
+cp .env.example .env
+npm run dev
+```
+
+No hosted database is required. Runtime state is written under `.baitrage/`:
+
+- `.baitrage/symbol-map.json`
+- `.baitrage/ingestion-state.json`
+- `.baitrage/rage-ledger.json`
+
+## Ingestion Layer
+
+### Camera
+
+The browser captures webcam video with `getUserMedia`. Low-rate JPEG frames are sent to the monitoring stream as `facial_affect`.
+
+### Microphone
+
+The browser records mono audio chunks with `MediaRecorder` and sends them as `vocal_affect`.
+
+### Screen Share
+
+The browser captures the active AI chat or IDE window with `getDisplayMedia`. Frames are sent as `chat_history_visual` so Gemini Flash Live can visually ground recent prompts, errors, and AI behavior across any external tool.
+
+Browser security requires the user to approve screen sharing.
+
+### Codebase Context
+
+Baitrage runs a local `chokidar` watcher over source directories. On add/change/delete events, it refreshes a lightweight symbol map without indexing full file contents.
+
+Extracted context:
+
+- project file summaries
+- function signatures
+- classes
+- interfaces
+- types
+- enums
+- top-level variables
+
+The dashboard subscribes to ingestion status through Server-Sent Events at `/api/ingest/codebase/stream`, avoiding noisy client polling.
+
+## Intelligence Layer
+
+### Observer
+
+Gemini Flash Live is the fast monitoring stream. It receives camera, audio, screen frames, active file context, and codebase ingestion status.
+
+Expected JSON output:
+
+```json
+{
+  "v_strain": 0.2,
+  "f_micro_expressions": 0.3,
+  "p_looping": 0.4,
+  "visiblePrompts": ["..."],
+  "relevantQuery": "...",
+  "reason": "..."
+}
+```
+
+### Frustration Coefficient
+
+```text
+F = (v_strain * 0.4) + (f_micro_expressions * 0.4) + (p_looping * 0.2)
+```
+
+When `F > 0.7`, the circuit closes.
+
+### Pivot Synthesis
+
+Gemini Pro is only called when the circuit closes. It receives:
+
+- last visible prompts from screen grounding
+- active file context
+- relevant symbols from `.baitrage/symbol-map.json`
+- frustration evaluation reason
+
+It returns the de-escalation advice and the optimized prompt.
+
+## UI
+
+The primary interface is a cinematic Mirror Dashboard:
+
+- full-width `SCREEN` camera feed
+- blue glow for idle
+- pulsing orange glow for warning
+- red glow for lockout
+- left panel: `ADVICE`
+- right panel: `OPTIMISED PROMPT`
+
+## Current Focus
+
+The priority is not autonomous coding yet. The priority is fast, accurate, impressive ingestion:
+
+- live screen observation
+- live codebase symbol updates
+- low-latency media capture
+- local ledger output
+- clean context feed for future agents
