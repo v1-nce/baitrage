@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import type { FrustrationEvaluation } from "@/lib/frustration-evaluator";
-import type { ActiveFileContext } from "@/hooks/useMultimodal";
+import type { FrustrationEvaluation, ActiveFileContext } from "@/lib/types";
 import { orchestrateBaitrageAgents } from "@/server/agent-orchestrator";
 
 export const runtime = "nodejs";
@@ -13,11 +12,12 @@ export async function POST(request: Request) {
     transcript?: string;
     visiblePrompts: string[];
   };
+
   const pivot = await orchestrateBaitrageAgents({
     activeFile: body.activeFile,
     evaluation: body.evaluation,
     transcript: body.transcript,
-    visiblePrompts: body.visiblePrompts.slice(-3)
+    visiblePrompts: body.visiblePrompts.slice(-3),
   });
 
   return NextResponse.json(pivot);

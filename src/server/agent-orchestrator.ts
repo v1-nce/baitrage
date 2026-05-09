@@ -5,12 +5,12 @@ import type {
   AgentTrace,
   BaitrageAgentRequest,
   BaitrageAgentResult,
+  CodebaseIngestionStatus,
   DeveloperIntent,
-  RageDecision
-} from "@/lib/orchestration-types";
+  RageDecision,
+  SymbolSearchResult,
+} from "@/lib/types";
 import { RAGE_THRESHOLD } from "@/lib/frustration-evaluator";
-import type { CodebaseIngestionStatus } from "@/lib/ingestion-types";
-import type { SymbolSearchResult } from "@/lib/symbol-types";
 import { getCodebaseIngestionStatus } from "@/server/codebase-ingestor";
 import { readLedger } from "@/server/local-ledger";
 import { searchSymbols } from "@/server/symbol-mapper";
@@ -18,180 +18,151 @@ import { searchSymbols } from "@/server/symbol-mapper";
 const outputSchema = z.object({
   advice: z.string().min(12).max(220),
   optimisedPrompt: z.string().min(40),
-  confidence: z.number().min(0).max(1)
+  confidence: z.number().min(0).max(1),
 });
 
-export async function orchestrateBaitrageAgents(
-  request: BaitrageAgentRequest
-): Promise<BaitrageAgentResult> {
+export async function orchestrateBaitrageAgents(request: BaitrageAgentRequest): Promise<BaitrageAgentResult> {
   const trace: AgentTrace[] = [];
-  const decision = timed("rage-sentinel", "local", trace, () => runRageSentinel(request));
-  const seedIntent = timed("intent-miner", "local", trace, () => inferIntent(request, []));
+  const t0 = performance.now();
 
-  const [ledger, ingestion, symbols] = await Promise.all([
-    timedAsync("ledger-reader", "local", trace, () => readLedger()),
-    timedAsync("codebase-scout", "local", trace, () => getCodebaseIngestionStatus()),
-    timedAsync("symbol-scout", "local", trace, () => searchSymbols(seedIntent.query, 10))
+  // Phase 1: all independent work in parallel
+  const seedIntent = inferIntent(request, []);
+  const [ledger, ingestion, symbols, decision] = await Promise.all([
+    readLedger(),
+    getCodebaseIngestionStatus(),
+    searchSymbols(seedIntent.query, 10),
+    Promise.resolve(runRageSentinel(request)),
   ]);
-  const intent = timed("intent-miner/refine", "local", trace, () => inferIntent(request, symbols));
 
-  const [advice, promptResult] = await Promise.all([
-    timedAsync("advice-coach", "local", trace, async () =>
-      createAdvice({ decision, intent, ingestion, symbols })
-    ),
-    timedAsync("prompt-architect", modelName(), trace, () =>
-      createPrompt({ request, decision, intent, ingestion, symbols })
-    )
-  ]);
+  trace.push({ agent: "seed", model: "local", durationMs: Math.round(performance.now() - t0), output: summarize(seedIntent) });
+
+  // Phase 2: refine intent with symbols, then synthesize prompt
+  const intent = inferIntent(request, symbols);
+  const prompts = normalizePrompts(request.visiblePrompts, request.evaluation.visiblePrompts);
+  const t1 = performance.now();
+
+  const { prompt, advice, source } = await createPrompt({ request, decision, intent, ingestion, symbols });
+  trace.push({ agent: "prompt-architect", model: modelName(), durationMs: Math.round(performance.now() - t1), output: summarize({ advice, source }) });
 
   return {
-    advice: promptResult.advice ?? advice,
-    prompt: promptResult.prompt,
-    summary: promptResult.advice ?? advice,
+    advice: advice ?? createAdvice(decision, intent, ingestion, symbols),
+    prompt,
+    summary: advice ?? createAdvice(decision, intent, ingestion, symbols),
     symbols,
-    visiblePrompts: normalizePrompts(request.visiblePrompts, request.evaluation.visiblePrompts),
-    source: promptResult.source,
+    visiblePrompts: prompts,
+    source,
     createdAt: new Date().toISOString(),
     decision,
     intent,
     ingestion,
     ledger,
-    trace
+    trace,
   };
 }
 
-function runRageSentinel(request: BaitrageAgentRequest): RageDecision {
-  const coefficient = request.evaluation.coefficient;
-  const hasLoop = request.evaluation.signals.pLooping > 0.30;
-  const action = coefficient > RAGE_THRESHOLD ? "lockout" : coefficient > 0.15 || hasLoop ? "warn" : "observe";
+/* ---- Rage Sentinel ---- */
 
+function runRageSentinel(req: BaitrageAgentRequest): RageDecision {
+  const c = req.evaluation.coefficient;
+  const hasLoop = req.evaluation.signals.pLooping > 0.3;
+  const action = c > RAGE_THRESHOLD ? "lockout" : c > 0.15 || hasLoop ? "warn" : "observe";
   return {
     action,
-    coefficient,
+    coefficient: c,
     urgency: action === "lockout" ? "high" : action === "warn" ? "medium" : "low",
-    reason: request.evaluation.reason
+    reason: req.evaluation.reason,
   };
 }
 
-function inferIntent(request: BaitrageAgentRequest, symbols: SymbolSearchResult[]): DeveloperIntent {
-  const prompts = normalizePrompts(request.visiblePrompts, request.evaluation.visiblePrompts);
-  const lastPrompt = prompts.at(-1) ?? request.evaluation.relevantQuery;
-  const activePath = request.activeFile?.path ?? "the active file";
-  const transcript = request.transcript ?? "";
-  const symbolHint = symbols
-    .slice(0, 4)
-    .map((symbol) => symbol.name)
-    .join(", ");
+/* ---- Intent Miner ---- */
 
-  // Prefer transcript for task inference if available
-  const inferredTask = transcript
-    ? transcript.slice(-200)
-    : lastPrompt || `Resolve the current issue in ${activePath}`;
+function inferIntent(req: BaitrageAgentRequest, symbols: SymbolSearchResult[]): DeveloperIntent {
+  const prompts = normalizePrompts(req.visiblePrompts, req.evaluation.visiblePrompts);
+  const lastPrompt = prompts.at(-1) ?? req.evaluation.relevantQuery;
+  const activePath = req.activeFile?.path ?? "the active file";
+  const t = req.transcript ?? "";
+  const symbolHint = symbols.slice(0, 4).map((s) => s.name).join(", ");
 
   return {
-    task: inferredTask,
-    failureMode: detectFailureMode([transcript, ...prompts].join(" ")),
-    query: [transcript.slice(-100), lastPrompt, activePath, symbolHint].filter(Boolean).join(" ")
+    task: t ? t.slice(-200) : lastPrompt || `Resolve the current issue in ${activePath}`,
+    failureMode: detectFailureMode([t, ...prompts].join(" ")),
+    query: [t.slice(-100), lastPrompt, activePath, symbolHint].filter(Boolean).join(" "),
   };
 }
 
-async function createPrompt({
-  request,
-  decision,
-  intent,
-  ingestion,
-  symbols
-}: {
+/* ---- Prompt Architect ---- */
+
+async function createPrompt(ctx: {
   request: BaitrageAgentRequest;
   decision: RageDecision;
   intent: DeveloperIntent;
   ingestion: CodebaseIngestionStatus;
   symbols: SymbolSearchResult[];
 }) {
-  const fallback = createFallbackPrompt({ request, decision, intent, ingestion, symbols });
+  const fallback = buildFallbackPrompt(ctx);
   if (!process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
-    return { prompt: fallback, source: "fallback" as const };
+    return { prompt: fallback, source: "fallback" as const, advice: undefined };
   }
 
   try {
     const { object } = await generateObject({
       model: google(modelName()),
       schema: outputSchema,
-      system:
-        "You are Baitrage's Prompt Architect. Convert failed AI coding loops into one calm, specific, codebase-aware prompt. Be concise and operational.",
-      prompt: orchestrationPrompt({ request, decision, intent, ingestion, symbols })
+      system: "You are Baitrage's Prompt Architect. Convert failed AI coding loops into one calm, specific, codebase-aware prompt. Be concise and operational.",
+      prompt: buildOrchestrationPrompt(ctx),
     });
-
-    return {
-      prompt: object.optimisedPrompt.trim(),
-      advice: object.advice.trim(),
-      source: "ai" as const
-    };
+    return { prompt: object.optimisedPrompt.trim(), advice: object.advice.trim(), source: "ai" as const };
   } catch {
-    return { prompt: fallback, source: "fallback" as const };
+    return { prompt: fallback, source: "fallback" as const, advice: undefined };
   }
 }
 
-function createAdvice({
-  decision,
-  intent,
-  ingestion,
-  symbols
-}: {
-  decision: RageDecision;
-  intent: DeveloperIntent;
-  ingestion: CodebaseIngestionStatus;
-  symbols: SymbolSearchResult[];
-}) {
-  if (decision.action === "lockout") {
-    return `Pause send. Baitrage found a ${intent.failureMode} loop and ${symbols.length} relevant symbols; use the rewritten prompt.`;
-  }
+/* ---- Advice (deterministic fallback only) ---- */
 
-  if (ingestion.state !== "ready") {
-    return "Hold one beat. The local codebase map is still indexing, so the next prompt may lack current project context.";
-  }
-
+function createAdvice(decision: RageDecision, intent: DeveloperIntent, ingestion: CodebaseIngestionStatus, symbols: SymbolSearchResult[]) {
+  if (decision.action === "lockout")
+    return `Pause. Baitrage found a ${intent.failureMode} loop and ${symbols.length} relevant symbols; use the rewritten prompt.`;
+  if (ingestion.state !== "ready")
+    return "Hold on — the local codebase map is still indexing, so the next prompt may lack project context.";
   return `Keep it narrow: ask for the smallest verified change around ${symbols[0]?.name ?? "the active code path"}.`;
 }
 
-function createFallbackPrompt({
-  request,
-  decision,
-  intent,
-  ingestion,
-  symbols
-}: {
+/* ---- Prompt Templates ---- */
+
+function buildFallbackPrompt(ctx: {
   request: BaitrageAgentRequest;
   decision: RageDecision;
   intent: DeveloperIntent;
   ingestion: CodebaseIngestionStatus;
   symbols: SymbolSearchResult[];
 }) {
-  const prompts = normalizePrompts(request.visiblePrompts, request.evaluation.visiblePrompts);
-  const symbolLines = symbols
+  const prompts = normalizePrompts(ctx.request.visiblePrompts, ctx.request.evaluation.visiblePrompts);
+  const symbolLines = ctx.symbols
     .slice(0, 8)
-    .map((symbol) => `- ${symbol.kind} ${symbol.name} at ${symbol.filePath}:${symbol.line}: ${symbol.signature}`)
+    .map((s) => `- ${s.kind} ${s.name} at ${s.filePath}:${s.line}: ${s.signature}`)
     .join("\n");
 
   return [
     "I am stuck in a coding issue. Help me resolve it calmly and systematically using the code context below.",
     "",
-    `What I was saying/doing: ${request.transcript || intent.task || "infer from the context below"}`,
-    `Observed failure mode: ${intent.failureMode}`,
-    request.activeFile ? `Active file: ${request.activeFile.path}` : "Active file: unknown",
-    `Codebase: ${ingestion.symbolCount} symbols indexed`,
+    `What I was saying/doing: ${ctx.request.transcript || ctx.intent.task || "infer from the context below"}`,
+    `Observed failure mode: ${ctx.intent.failureMode}`,
+    ctx.request.evaluation.agentContext ? `AI Agent/Tool used: ${ctx.request.evaluation.agentContext}` : "AI Agent/Tool used: unknown",
+    ctx.request.evaluation.workspaceName ? `Workspace/Project: ${ctx.request.evaluation.workspaceName}` : "Workspace/Project: unknown",
+    ctx.request.activeFile ? `Active file: ${ctx.request.activeFile.path}` : "Active file: unknown",
+    `Codebase: ${ctx.ingestion.symbolCount} symbols indexed`,
     "",
     "Last visible prompts:",
-    prompts.map((prompt, index) => `${index + 1}. ${prompt}`).join("\n") || "- Not available from screen share yet",
+    prompts.map((p, i) => `${i + 1}. ${p}`).join("\n") || "- Not available from screen share yet",
     "",
     "Relevant code symbols:",
     symbolLines || "- No matching symbols found yet",
     "",
-    "Please identify the root cause based on what I described above, reference the relevant files/functions, and propose the smallest safe change with a verification step."
+    "Please identify the root cause, reference the relevant files/functions, and propose the smallest safe change with a verification step.",
   ].join("\n");
 }
 
-function orchestrationPrompt(args: {
+function buildOrchestrationPrompt(ctx: {
   request: BaitrageAgentRequest;
   decision: RageDecision;
   intent: DeveloperIntent;
@@ -201,57 +172,47 @@ function orchestrationPrompt(args: {
   return [
     "Return structured JSON only.",
     "",
-    "Advice: one actionable sentence (<220 chars) about what the developer should do RIGHT NOW based on their speech and code context.",
-    "Optimised prompt: a calm, specific prompt the developer can paste directly into their AI coding tool (Claude, Cursor, Codex).",
+    "Advice: one actionable sentence (<220 chars) about what the developer should do RIGHT NOW.",
+    "Optimised prompt: a calm, specific prompt the developer can paste into their AI coding tool.",
     "The prompt MUST reference the developer's actual problem from their speech/screen, not generic advice.",
     "",
     "Developer's recent speech:",
-    args.request.transcript || "(no transcript available)",
+    ctx.request.transcript || "(no transcript available)",
     "",
     "Rage decision:",
-    JSON.stringify(args.decision),
+    JSON.stringify(ctx.decision),
     "",
     "Developer intent:",
-    JSON.stringify(args.intent),
+    JSON.stringify(ctx.intent),
+    "",
+    "AI Agent/Tool used:",
+    ctx.request.evaluation.agentContext || "unknown",
+    "",
+    "Workspace/Project Name:",
+    ctx.request.evaluation.workspaceName || "unknown",
     "",
     "Active file:",
-    args.request.activeFile
-      ? `${args.request.activeFile.path}:${args.request.activeFile.cursor?.line ?? 1}`
-      : "unknown",
+    ctx.request.activeFile ? `${ctx.request.activeFile.path}:${ctx.request.activeFile.cursor?.line ?? 1}` : "unknown",
     "",
     "Visible prompts from screen:",
-    normalizePrompts(args.request.visiblePrompts, args.request.evaluation.visiblePrompts).join("\n") ||
-      "none",
+    normalizePrompts(ctx.request.visiblePrompts, ctx.request.evaluation.visiblePrompts).join("\n") || "none",
     "",
     "Relevant codebase symbols:",
-    args.symbols
-      .map((symbol) => `${symbol.kind} ${symbol.name} ${symbol.filePath}:${symbol.line} ${symbol.signature}`)
-      .join("\n") || "none"
+    ctx.symbols.map((s) => `${s.kind} ${s.name} ${s.filePath}:${s.line} ${s.signature}`).join("\n") || "none",
   ].join("\n");
 }
 
+/* ---- Utilities ---- */
+
 function normalizePrompts(...groups: string[][]) {
-  return groups
-    .flat()
-    .map((prompt) => prompt.trim())
-    .filter(Boolean)
-    .slice(-3);
+  return groups.flat().map((p) => p.trim()).filter(Boolean).slice(-3);
 }
 
 function detectFailureMode(text: string) {
-  const lower = text.toLowerCase();
-  if (/(again|still|same|keeps|loop|not working|doesn't work)/.test(lower)) {
-    return "repeated failed fix";
-  }
-
-  if (/(type|typescript|compile|build|lint)/.test(lower)) {
-    return "compile or type error";
-  }
-
-  if (/(api|request|response|route|server)/.test(lower)) {
-    return "integration or API mismatch";
-  }
-
+  const l = text.toLowerCase();
+  if (/(again|still|same|keeps|loop|not working|doesn't work)/.test(l)) return "repeated failed fix";
+  if (/(type|typescript|compile|build|lint)/.test(l)) return "compile or type error";
+  if (/(api|request|response|route|server)/.test(l)) return "integration or API mismatch";
   return "underspecified coding request";
 }
 
@@ -259,35 +220,6 @@ function modelName() {
   return process.env.GEMINI_PRO_MODEL ?? "gemini-3.1-pro-preview";
 }
 
-function timed<T>(agent: string, model: AgentTrace["model"], trace: AgentTrace[], run: () => T): T {
-  const started = performance.now();
-  const output = run();
-  trace.push({
-    agent,
-    model,
-    durationMs: Math.round(performance.now() - started),
-    output: summarize(output)
-  });
-  return output;
-}
-
-async function timedAsync<T>(
-  agent: string,
-  model: AgentTrace["model"],
-  trace: AgentTrace[],
-  run: () => Promise<T>
-): Promise<T> {
-  const started = performance.now();
-  const output = await run();
-  trace.push({
-    agent,
-    model,
-    durationMs: Math.round(performance.now() - started),
-    output: summarize(output)
-  });
-  return output;
-}
-
-function summarize(value: unknown) {
-  return JSON.stringify(value).slice(0, 240);
+function summarize(v: unknown) {
+  return JSON.stringify(v).slice(0, 240);
 }

@@ -12,30 +12,17 @@ export function GET() {
 
   const close = () => {
     closed = true;
-    if (statusTimer) {
-      clearInterval(statusTimer);
-      statusTimer = null;
-    }
-
-    if (heartbeatTimer) {
-      clearInterval(heartbeatTimer);
-      heartbeatTimer = null;
-    }
+    if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
   };
 
   const stream = new ReadableStream({
     async start(controller) {
       const emit = async (force = false) => {
-        if (closed) {
-          return;
-        }
-
+        if (closed) return;
         const status = await getCodebaseIngestionStatus();
         const payload = JSON.stringify(status);
-        if (!force && payload === lastPayload) {
-          return;
-        }
-
+        if (!force && payload === lastPayload) return;
         lastPayload = payload;
         controller.enqueue(encoder.encode(`event: status\ndata: ${payload}\n\n`));
       };
@@ -44,25 +31,13 @@ export function GET() {
       lastPayload = JSON.stringify(status);
       controller.enqueue(encoder.encode(`event: status\ndata: ${lastPayload}\n\n`));
 
-      statusTimer = setInterval(() => {
-        void emit();
-      }, 1000);
-      heartbeatTimer = setInterval(() => {
-        if (!closed) {
-          controller.enqueue(encoder.encode(": heartbeat\n\n"));
-        }
-      }, 15000);
+      statusTimer = setInterval(() => void emit(), 1000);
+      heartbeatTimer = setInterval(() => { if (!closed) controller.enqueue(encoder.encode(": heartbeat\n\n")); }, 15_000);
     },
-    cancel() {
-      close();
-    }
+    cancel() { close(); },
   });
 
   return new Response(stream, {
-    headers: {
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-      "Content-Type": "text/event-stream"
-    }
+    headers: { "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "Content-Type": "text/event-stream" },
   });
 }

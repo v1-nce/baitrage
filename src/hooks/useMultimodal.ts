@@ -1,38 +1,20 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type MutableRefObject } from "react";
-import {
-  evaluateFrustration,
-  type DetectorMessage,
-  type FrustrationEvaluation,
-  RAGE_THRESHOLD
-} from "@/lib/frustration-evaluator";
-import type { SymbolSearchResult } from "@/lib/symbol-types";
-import type { CodebaseIngestionStatus } from "@/lib/ingestion-types";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { evaluateFrustration, resetFrustrationState, RAGE_THRESHOLD } from "@/lib/frustration-evaluator";
+import type {
+  ActiveFileContext,
+  CodebaseIngestionStatus,
+  DetectorMessage,
+  FrustrationEvaluation,
+  PivotPrompt,
+} from "@/lib/types";
 
 /* ------------------------------------------------------------------ */
 /*  Public types                                                      */
 /* ------------------------------------------------------------------ */
 
-export type ConnectionState = "idle" | "capturing" | "connecting" | "streaming" | "local" | "degraded" | "error";
-
-export type ActiveFileContext = {
-  path: string;
-  language?: string;
-  content?: string;
-  cursor?: { line?: number; column?: number };
-  updatedAt: string;
-};
-
-export type PivotPrompt = {
-  advice?: string;
-  prompt: string;
-  summary: string;
-  symbols: SymbolSearchResult[];
-  visiblePrompts: string[];
-  source: "ai" | "fallback";
-  createdAt: string;
-};
+export type ConnectionState = "idle" | "capturing" | "analyzing" | "error";
 
 export type MultimodalState = {
   activeFile: ActiveFileContext | null;
@@ -65,7 +47,7 @@ const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
   width: { ideal: 320, max: 640 },
   height: { ideal: 180, max: 360 },
   frameRate: { ideal: 10, max: 12 },
-  facingMode: "user"
+  facingMode: "user",
 };
 
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
@@ -73,24 +55,48 @@ const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   echoCancellation: true,
   noiseSuppression: true,
   autoGainControl: true,
-  sampleRate: 16000
+  sampleRate: 16000,
 };
 
 const SCREEN_CONSTRAINTS: MediaTrackConstraints = {
   width: { ideal: 1280, max: 1920 },
   height: { ideal: 720, max: 1080 },
-  frameRate: { ideal: 2, max: 3 }
+  frameRate: { ideal: 2, max: 3 },
 };
 
 const CAMERA_FRAME_INTERVAL_MS = 750;
 const SCREEN_FRAME_INTERVAL_MS = 1800;
-const RECALIBRATION_COOLDOWN_MS = 10000;
-const CONTEXT_EVENT_NAME = "active-file";
+const RECALIBRATION_COOLDOWN_MS = 10_000;
 const AUDIO_LEVEL_INTERVAL_MS = 100;
-const CONTENT_ANALYSIS_INTERVAL_MS = 5000;
+const CONTENT_ANALYSIS_INTERVAL_MS = 3_000;
 
 /* ------------------------------------------------------------------ */
-/*  Audio-level measurement (UI bar only — NOT used for frustration)  */
+/*  SpeechRecognition shim (Chrome/Edge)                              */
+/* ------------------------------------------------------------------ */
+
+type SpeechRecognitionEvent = Event & { results: SpeechRecognitionResultList; resultIndex: number };
+type SpeechRecognitionInstance = EventTarget & {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+
+function createSpeechRecognition(): SpeechRecognitionInstance | null {
+  const W = window as unknown as Record<string, unknown>;
+  const Ctor = (W.SpeechRecognition ?? W.webkitSpeechRecognition) as (new () => SpeechRecognitionInstance) | undefined;
+  if (!Ctor) return null;
+  const rec = new Ctor();
+  rec.continuous = true;
+  rec.interimResults = false;
+  rec.lang = "en-US";
+  return rec;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Utilities                                                         */
 /* ------------------------------------------------------------------ */
 
 function measureRMS(analyser: AnalyserNode | null): number {
@@ -99,43 +105,37 @@ function measureRMS(analyser: AnalyserNode | null): number {
   analyser.getByteTimeDomainData(data);
   let sum = 0;
   for (let i = 0; i < data.length; i++) {
-    const sample = (data[i] - 128) / 128;
-    sum += sample * sample;
+    const s = (data[i] - 128) / 128;
+    sum += s * s;
   }
   return Math.sqrt(sum / data.length);
 }
 
-/* ------------------------------------------------------------------ */
-/*  SpeechRecognition type shim (Chrome/Edge)                         */
-/* ------------------------------------------------------------------ */
-
-type SpeechRecognitionEvent = Event & {
-  results: SpeechRecognitionResultList;
-  resultIndex: number;
-};
-
-function createSpeechRecognition(): {
-  recognition: EventTarget & { start: () => void; stop: () => void; abort: () => void };
-  supported: boolean;
-} | null {
-  const W = window as unknown as Record<string, unknown>;
-  const Ctor = (W.SpeechRecognition ?? W.webkitSpeechRecognition) as
-    | (new () => EventTarget & {
-        continuous: boolean;
-        interimResults: boolean;
-        lang: string;
-        start: () => void;
-        stop: () => void;
-        abort: () => void;
-      })
-    | undefined;
-
-  if (!Ctor) return null;
-  const recognition = new Ctor();
-  recognition.continuous = true;
-  recognition.interimResults = false;
-  recognition.lang = "en-US";
-  return { recognition, supported: true };
+function captureFrame(
+  stream: MediaStream,
+  width: number,
+  height: number,
+  quality: number,
+): { video: HTMLVideoElement; canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; grab: () => string } {
+  const video = document.createElement("video");
+  video.srcObject = stream;
+  video.muted = true;
+  video.playsInline = true;
+  void video.play();
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d", { alpha: false })!;
+  return {
+    video,
+    canvas,
+    ctx,
+    grab: () => {
+      if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return "";
+      ctx.drawImage(video, 0, 0, width, height);
+      return canvas.toDataURL("image/jpeg", quality).replace(/^data:image\/jpeg;base64,/, "");
+    },
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -163,67 +163,52 @@ export function useMultimodal(): MultimodalState {
   const activeFileRef = useRef<ActiveFileContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const analysisInFlightRef = useRef(false);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const audioLevelTimerRef = useRef<number | null>(null);
-  const cameraFrameTimerRef = useRef<number | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const codebaseSourceRef = useRef<EventSource | null>(null);
-  const contentAnalysisTimerRef = useRef<number | null>(null);
   const contextSourceRef = useRef<EventSource | null>(null);
-  const lastRecalibrationAtRef = useRef(0);
-  const latestCameraFrameRef = useRef("");
-  const latestScreenFrameRef = useRef("");
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const screenFrameTimerRef = useRef<number | null>(null);
+  const lastRecalRef = useRef(0);
+  const latestCameraRef = useRef("");
+  const latestScreenRef = useRef("");
+  const recentScoresRef = useRef<number[]>([]);
   const screenStreamRef = useRef<MediaStream | null>(null);
-  const speechRecRef = useRef<ReturnType<typeof createSpeechRecognition>>(null);
+  const speechRecRef = useRef<SpeechRecognitionInstance | null>(null);
   const transcriptChunksRef = useRef<string[]>([]);
   const visiblePromptsRef = useRef<string[]>([]);
-  const websocketRef = useRef<WebSocket | null>(null);
+
+  // Timer refs
+  const timers = useRef<{ audio?: number; camera?: number; screen?: number; analysis?: number }>({});
 
   /* ---- helpers ---- */
-
-  const sendJson = useCallback((payload: unknown) => {
-    const socket = websocketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify(payload));
-  }, []);
 
   const dismissPivot = useCallback(() => {
     setPivotPrompt(null);
     setIsLocked(false);
   }, []);
 
-  /* ---- recalibration ---- */
+  /* ---- recalibration (circuit breaker fires) ---- */
 
-  const triggerRecalibration = useCallback(async (nextEvaluation: FrustrationEvaluation) => {
+  const triggerRecalibration = useCallback(async (nextEval: FrustrationEvaluation) => {
     const now = Date.now();
-    if (now - lastRecalibrationAtRef.current < RECALIBRATION_COOLDOWN_MS) return;
-    lastRecalibrationAtRef.current = now;
+    if (now - lastRecalRef.current < RECALIBRATION_COOLDOWN_MS) return;
+    lastRecalRef.current = now;
     setIsRecalibrating(true);
 
     try {
-      const response = await fetch("/api/recalibrate", {
+      const res = await fetch("/api/recalibrate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           activeFile: activeFileRef.current,
-          evaluation: nextEvaluation,
+          evaluation: nextEval,
           transcript: transcriptChunksRef.current.slice(-5).join(" "),
-          visiblePrompts: nextEvaluation.visiblePrompts.length
-            ? nextEvaluation.visiblePrompts
-            : visiblePromptsRef.current
-        })
+          visiblePrompts: nextEval.visiblePrompts.length ? nextEval.visiblePrompts : visiblePromptsRef.current,
+        }),
       });
-      if (!response.ok) throw new Error("Recalibration request failed");
-      const pivot = (await response.json()) as PivotPrompt;
-      setPivotPrompt(pivot);
-    } catch (recalibrationError) {
-      setError(
-        recalibrationError instanceof Error
-          ? recalibrationError.message
-          : "Unable to synthesize pivot prompt"
-      );
+      if (!res.ok) throw new Error("Recalibration failed");
+      setPivotPrompt(await res.json() as PivotPrompt);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unable to synthesize pivot prompt");
     } finally {
       setIsRecalibrating(false);
     }
@@ -232,45 +217,82 @@ export function useMultimodal(): MultimodalState {
   /* ---- detector message handler ---- */
 
   const handleDetectorMessage = useCallback(
-    (message: DetectorMessage) => {
-      const nextEvaluation = evaluateFrustration(message);
-      visiblePromptsRef.current = nextEvaluation.visiblePrompts.length
-        ? nextEvaluation.visiblePrompts
-        : visiblePromptsRef.current;
+    (msg: DetectorMessage) => {
+      const nextEval = evaluateFrustration(msg);
+      visiblePromptsRef.current = nextEval.visiblePrompts.length ? nextEval.visiblePrompts : visiblePromptsRef.current;
 
-      setEvaluation(nextEvaluation);
-      setFrustration(nextEvaluation.coefficient);
-      setIsLocked(nextEvaluation.isLocked);
+      // Track recent scores for trajectory analysis
+      recentScoresRef.current = [...recentScoresRef.current.slice(-4), nextEval.coefficient];
 
-      if (nextEvaluation.coefficient > RAGE_THRESHOLD) {
-        void triggerRecalibration(nextEvaluation);
+      setEvaluation(nextEval);
+      setFrustration(nextEval.coefficient);
+      setIsLocked(nextEval.isLocked);
+
+      if (nextEval.coefficient > RAGE_THRESHOLD) {
+        void triggerRecalibration(nextEval);
       }
     },
-    [triggerRecalibration]
+    [triggerRecalibration],
   );
 
-  /* ---- audio level meter (UI only) ---- */
+  /* ---- content analysis (Gemini Flash polling) ---- */
 
-  const startAudioLevelMeter = useCallback(() => {
-    if (audioLevelTimerRef.current) return;
-    audioLevelTimerRef.current = window.setInterval(() => {
-      const rms = measureRMS(analyserRef.current);
-      setAudioLevel(Math.min(1, rms / 0.12));
-    }, AUDIO_LEVEL_INTERVAL_MS);
-  }, []);
+  const startContentAnalysis = useCallback(() => {
+    if (timers.current.analysis) return;
+
+    timers.current.analysis = window.setInterval(async () => {
+      if (analysisInFlightRef.current) return;
+      analysisInFlightRef.current = true;
+
+      try {
+        const recentTranscript = transcriptChunksRef.current.slice(-5).join(" ");
+        const res = await fetch("/api/analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            cameraFrame: latestCameraRef.current || undefined,
+            screenFrame: latestScreenRef.current || undefined,
+            transcript: recentTranscript || undefined,
+            activeFilePath: activeFileRef.current?.path,
+            recentScores: recentScoresRef.current,
+          }),
+        });
+        if (!res.ok) return;
+        handleDetectorMessage(await res.json() as DetectorMessage);
+      } catch {
+        // Silently skip
+      } finally {
+        analysisInFlightRef.current = false;
+      }
+    }, CONTENT_ANALYSIS_INTERVAL_MS);
+  }, [handleDetectorMessage]);
+
+  /* ---- frame streaming ---- */
+
+  const startFrameCapture = useCallback(
+    (opts: { stream: MediaStream; kind: "camera" | "screen"; intervalMs: number; w: number; h: number; q: number }) => {
+      const { grab } = captureFrame(opts.stream, opts.w, opts.h, opts.q);
+      const key = opts.kind === "camera" ? "camera" : "screen";
+      const ref = opts.kind === "camera" ? latestCameraRef : latestScreenRef;
+
+      timers.current[key] = window.setInterval(() => {
+        const frame = grab();
+        if (frame) ref.current = frame;
+      }, opts.intervalMs);
+    },
+    [],
+  );
 
   /* ---- speech recognition ---- */
 
   const startSpeechRecognition = useCallback(() => {
     if (speechRecRef.current) return;
-    const result = createSpeechRecognition();
-    if (!result) return;
+    const rec = createSpeechRecognition();
+    if (!rec) return;
+    speechRecRef.current = rec;
 
-    speechRecRef.current = result;
-    const { recognition } = result;
-
-    recognition.addEventListener("result", ((event: SpeechRecognitionEvent) => {
-      const latest = event.results[event.results.length - 1];
+    rec.addEventListener("result", ((e: SpeechRecognitionEvent) => {
+      const latest = e.results[e.results.length - 1];
       if (latest && (latest as unknown as { isFinal: boolean }).isFinal) {
         const text = (latest[0] as unknown as { transcript: string }).transcript.trim();
         if (text) {
@@ -281,82 +303,63 @@ export function useMultimodal(): MultimodalState {
       }
     }) as EventListener);
 
-    recognition.addEventListener("end", () => {
-      // Auto-restart if not stopped manually
-      try { recognition.start(); } catch { /* already running or stopped */ }
+    rec.addEventListener("end", () => {
+      try { rec.start(); } catch { /* already running or stopped */ }
     });
 
-    try { recognition.start(); } catch { /* not supported */ }
+    try { rec.start(); } catch { /* not supported */ }
   }, []);
 
-  /* ---- content analysis (Gemini Flash) ---- */
+  /* ---- context & codebase SSE streams ---- */
 
-  const startContentAnalysis = useCallback(() => {
-    if (contentAnalysisTimerRef.current) return;
+  const startContextStream = useCallback(() => {
+    if (!("EventSource" in window) || contextSourceRef.current) return;
+    const src = new EventSource("/api/context/stream");
+    contextSourceRef.current = src;
+    src.addEventListener("active-file", (e) => {
+      const next = JSON.parse((e as MessageEvent).data) as ActiveFileContext;
+      activeFileRef.current = next;
+      setActiveFile(next);
+    });
+    src.onerror = () => { src.close(); contextSourceRef.current = null; };
+  }, []);
 
-    contentAnalysisTimerRef.current = window.setInterval(async () => {
-      if (analysisInFlightRef.current) return;
-      analysisInFlightRef.current = true;
-
-      try {
-        const recentTranscript = transcriptChunksRef.current.slice(-5).join(" ");
-
-        const response = await fetch("/api/analyze", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            cameraFrame: latestCameraFrameRef.current || undefined,
-            screenFrame: latestScreenFrameRef.current || undefined,
-            transcript: recentTranscript || undefined,
-            activeFilePath: activeFileRef.current?.path
-          })
-        });
-
-        if (!response.ok) return;
-        const analysis = (await response.json()) as DetectorMessage;
-        handleDetectorMessage(analysis);
-      } catch {
-        // Silently skip failed analysis
-      } finally {
-        analysisInFlightRef.current = false;
-      }
-    }, CONTENT_ANALYSIS_INTERVAL_MS);
-  }, [handleDetectorMessage]);
+  const startCodebaseStream = useCallback(() => {
+    if (!("EventSource" in window) || codebaseSourceRef.current) return;
+    const src = new EventSource("/api/ingest/codebase/stream");
+    codebaseSourceRef.current = src;
+    src.addEventListener("status", (e) => {
+      setCodebaseStatus(JSON.parse((e as MessageEvent).data) as CodebaseIngestionStatus);
+    });
+    src.onerror = () => { src.close(); codebaseSourceRef.current = null; };
+  }, []);
 
   /* ---- stop ---- */
 
   const stop = useCallback(() => {
-    [cameraFrameTimerRef, screenFrameTimerRef, audioLevelTimerRef, contentAnalysisTimerRef].forEach(
-      (ref) => {
-        if (ref.current) {
-          window.clearInterval(ref.current);
-          ref.current = null;
-        }
-      }
-    );
+    Object.values(timers.current).forEach((t) => { if (t) window.clearInterval(t); });
+    timers.current = {};
 
-    mediaRecorderRef.current?.stop();
-    mediaRecorderRef.current = null;
-    websocketRef.current?.close(1000, "capture stopped");
-    websocketRef.current = null;
     contextSourceRef.current?.close();
     contextSourceRef.current = null;
     codebaseSourceRef.current?.close();
     codebaseSourceRef.current = null;
 
-    try { speechRecRef.current?.recognition.abort(); } catch { /* ok */ }
+    try { speechRecRef.current?.abort(); } catch { /* ok */ }
     speechRecRef.current = null;
 
     cameraStreamRef.current?.getTracks().forEach((t) => t.stop());
     cameraStreamRef.current = null;
     screenStreamRef.current?.getTracks().forEach((t) => t.stop());
     screenStreamRef.current = null;
-    audioContextRef.current?.close();
-    audioContextRef.current = null;
+    audioCtxRef.current?.close();
+    audioCtxRef.current = null;
 
-    latestCameraFrameRef.current = "";
-    latestScreenFrameRef.current = "";
+    latestCameraRef.current = "";
+    latestScreenRef.current = "";
     transcriptChunksRef.current = [];
+    recentScoresRef.current = [];
+    resetFrustrationState();
 
     setAudioAnalyser(null);
     setAudioLevel(0);
@@ -365,158 +368,6 @@ export function useMultimodal(): MultimodalState {
     setScreenStream(null);
     setTranscript("");
   }, []);
-
-  /* ---- Gemini Live WebSocket ---- */
-
-  const connectGeminiLive = useCallback(async () => {
-    setConnectionState("connecting");
-    try {
-      const tokenResponse = await fetch("/api/gemini-token");
-      if (!tokenResponse.ok) throw new Error("Token fetch failed");
-      const { wsUrl, model } = (await tokenResponse.json()) as { wsUrl: string; model: string };
-      if (!wsUrl) { setConnectionState("local"); return; }
-
-      const socket = new WebSocket(wsUrl);
-      websocketRef.current = socket;
-
-      socket.onopen = () => {
-        setConnectionState("streaming");
-        socket.send(JSON.stringify({
-          setup: {
-            model: `models/${model}`,
-            generationConfig: { responseModalities: ["TEXT"] },
-            systemInstruction: {
-              parts: [{
-                text: "You are Baitrage's fast detector. Analyse the developer's camera, audio, and screen for signs of frustration. Return compact JSON with: v_strain (0-1 based on speech CONTENT not volume), f_micro_expressions (0-1 facial tension), p_looping (0-1 prompt repetition), visiblePrompts (string[]), relevantQuery (string), reason (string). Volume does NOT equal frustration — only content matters."
-              }]
-            }
-          }
-        }));
-      };
-
-      socket.onmessage = (event) => {
-        try {
-          const data = JSON.parse(String(event.data));
-          if (data.serverContent?.modelTurn?.parts) {
-            for (const part of data.serverContent.modelTurn.parts) {
-              if (part.text) {
-                try {
-                  handleDetectorMessage(JSON.parse(part.text) as DetectorMessage);
-                } catch { /* not valid JSON */ }
-              }
-            }
-          } else if (!data.setupComplete) {
-            handleDetectorMessage(data as DetectorMessage);
-          }
-        } catch {
-          setConnectionState("local");
-        }
-      };
-
-      socket.onerror = () => { setConnectionState("local"); };
-      socket.onclose = () => { setConnectionState((s) => s === "idle" ? s : "local"); };
-    } catch {
-      setConnectionState("local");
-    }
-  }, [handleDetectorMessage]);
-
-  /* ---- context streams ---- */
-
-  const startContextStream = useCallback(() => {
-    if (!("EventSource" in window) || contextSourceRef.current) return;
-    const source = new EventSource("/api/context/stream");
-    contextSourceRef.current = source;
-    source.addEventListener(CONTEXT_EVENT_NAME, (event) => {
-      const nextFile = JSON.parse((event as MessageEvent).data) as ActiveFileContext;
-      activeFileRef.current = nextFile;
-      setActiveFile(nextFile);
-      sendJson({
-        realtimeInput: {
-          text: JSON.stringify({ type: "context.active_file", activeFile: { ...nextFile, content: nextFile.content?.slice(0, 1200) } })
-        }
-      });
-    });
-    source.onerror = () => { source.close(); contextSourceRef.current = null; };
-  }, [sendJson]);
-
-  const startCodebaseStream = useCallback(() => {
-    if (!("EventSource" in window) || codebaseSourceRef.current) return;
-    const source = new EventSource("/api/ingest/codebase/stream");
-    codebaseSourceRef.current = source;
-    source.addEventListener("status", (event) => {
-      setCodebaseStatus(JSON.parse((event as MessageEvent).data) as CodebaseIngestionStatus);
-    });
-    source.onerror = () => { source.close(); codebaseSourceRef.current = null; };
-  }, []);
-
-  /* ---- frame streaming ---- */
-
-  const startFrameStream = useCallback(
-    ({ stream, kind, intervalMs, width, height, quality, timerRef }: {
-      stream: MediaStream;
-      kind: "camera" | "screen";
-      intervalMs: number;
-      width: number;
-      height: number;
-      quality: number;
-      timerRef: MutableRefObject<number | null>;
-    }) => {
-      const video = document.createElement("video");
-      video.srcObject = stream;
-      video.muted = true;
-      video.playsInline = true;
-      void video.play();
-
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext("2d", { alpha: false });
-
-      timerRef.current = window.setInterval(() => {
-        if (!ctx || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const base64 = canvas.toDataURL("image/jpeg", quality).replace(/^data:image\/jpeg;base64,/, "");
-
-        // Store latest frame for content analysis
-        if (kind === "camera") latestCameraFrameRef.current = base64;
-        else latestScreenFrameRef.current = base64;
-
-        // Also send to Gemini Live if connected
-        sendJson({
-          realtimeInput: { mediaChunks: [{ mimeType: "image/jpeg", data: base64 }] }
-        });
-      }, intervalMs);
-    },
-    [sendJson]
-  );
-
-  /* ---- audio ---- */
-
-  const startAudio = useCallback(
-    (stream: MediaStream) => {
-      const audioContext = new AudioContext({ sampleRate: 16000 });
-      const source = audioContext.createMediaStreamSource(stream);
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 512;
-      source.connect(analyser);
-      audioContextRef.current = audioContext;
-      analyserRef.current = analyser;
-      setAudioAnalyser(analyser);
-
-      const mimeType = getSupportedAudioMimeType();
-      const audioOnlyStream = new MediaStream(stream.getAudioTracks());
-      const recorder = new MediaRecorder(audioOnlyStream, mimeType ? { mimeType } : undefined);
-      mediaRecorderRef.current = recorder;
-
-      recorder.ondataavailable = async (event) => {
-        if (!event.data.size) return;
-        const base64 = await blobToBase64(event.data);
-        sendJson({ realtimeInput: { mediaChunks: [{ mimeType: recorder.mimeType || "audio/webm", data: base64 }] } });
-      };
-      recorder.start(500);
-    },
-    [sendJson]
-  );
 
   /* ---- screen share ---- */
 
@@ -529,20 +380,17 @@ export function useMultimodal(): MultimodalState {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: SCREEN_CONSTRAINTS, audio: false });
       screenStreamRef.current = stream;
       setScreenStream(stream);
-      startFrameStream({
-        stream, kind: "screen", intervalMs: SCREEN_FRAME_INTERVAL_MS,
-        width: 960, height: 540, quality: 0.36, timerRef: screenFrameTimerRef
-      });
+      startFrameCapture({ stream, kind: "screen", intervalMs: SCREEN_FRAME_INTERVAL_MS, w: 960, h: 540, q: 0.36 });
       stream.getVideoTracks()[0]?.addEventListener("ended", () => {
-        if (screenFrameTimerRef.current) { window.clearInterval(screenFrameTimerRef.current); screenFrameTimerRef.current = null; }
+        if (timers.current.screen) { window.clearInterval(timers.current.screen); timers.current.screen = undefined; }
         screenStreamRef.current = null;
-        latestScreenFrameRef.current = "";
+        latestScreenRef.current = "";
         setScreenStream(null);
       });
-    } catch (screenError) {
-      setError(screenError instanceof Error ? screenError.message : "Unable to start screen sharing");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unable to start screen sharing");
     }
-  }, [startFrameStream]);
+  }, [startFrameCapture]);
 
   /* ---- start ---- */
 
@@ -554,33 +402,40 @@ export function useMultimodal(): MultimodalState {
       cameraStreamRef.current = stream;
       setMediaStream(stream);
 
-      startAudio(stream);
-      startFrameStream({
-        stream, kind: "camera", intervalMs: CAMERA_FRAME_INTERVAL_MS,
-        width: 320, height: 180, quality: 0.45, timerRef: cameraFrameTimerRef
-      });
+      // Audio analyser (UI level meter only)
+      const audioCtx = new AudioContext({ sampleRate: 16000 });
+      const source = audioCtx.createMediaStreamSource(stream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+      audioCtxRef.current = audioCtx;
+      analyserRef.current = analyser;
+      setAudioAnalyser(analyser);
+
+      timers.current.audio = window.setInterval(() => {
+        setAudioLevel(Math.min(1, measureRMS(analyserRef.current) / 0.12));
+      }, AUDIO_LEVEL_INTERVAL_MS);
+
+      startFrameCapture({ stream, kind: "camera", intervalMs: CAMERA_FRAME_INTERVAL_MS, w: 320, h: 180, q: 0.45 });
       startContextStream();
       startCodebaseStream();
-      startAudioLevelMeter();
       startSpeechRecognition();
       startContentAnalysis();
 
-      await connectGeminiLive();
+      setConnectionState("analyzing");
       await startScreenShare();
-    } catch (captureError) {
-      setError(captureError instanceof Error ? captureError.message : "Unable to start media capture");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unable to start media capture");
       setConnectionState("error");
     }
-  }, [connectGeminiLive, startAudio, startAudioLevelMeter, startCodebaseStream, startContentAnalysis, startContextStream, startFrameStream, startScreenShare, startSpeechRecognition]);
+  }, [startCodebaseStream, startContentAnalysis, startContextStream, startFrameCapture, startScreenShare, startSpeechRecognition]);
 
   /* ---- cleanup ---- */
-
-  useEffect(() => { return () => stop(); }, [stop]);
+  useEffect(() => () => stop(), [stop]);
 
   /* ---- ledger telemetry ---- */
-
   useEffect(() => {
-    const controller = new AbortController();
+    const ctrl = new AbortController();
     const timer = window.setTimeout(() => {
       void fetch("/api/ledger", {
         method: "POST",
@@ -595,35 +450,18 @@ export function useMultimodal(): MultimodalState {
           isScreenSharing: Boolean(screenStream),
           prompt: pivotPrompt?.prompt,
           reason: evaluation?.reason,
-          updatedAt: new Date().toISOString()
+          updatedAt: new Date().toISOString(),
         }),
-        signal: controller.signal
+        signal: ctrl.signal,
       }).catch(() => undefined);
     }, 250);
-    return () => { controller.abort(); window.clearTimeout(timer); };
+    return () => { ctrl.abort(); window.clearTimeout(timer); };
   }, [activeFile?.path, connectionState, evaluation?.reason, frustration, isLocked, isRecalibrating, pivotPrompt?.advice, pivotPrompt?.prompt, pivotPrompt?.summary, screenStream]);
 
   return {
     activeFile, audioAnalyser, audioLevel, codebaseStatus, connectionState, error,
     evaluation, frustration, isCapturing: Boolean(mediaStream), isLocked, isRecalibrating,
     isScreenSharing: Boolean(screenStream), mediaStream, pivotPrompt, screenStream, transcript,
-    start, startScreenShare, stop, dismissPivot
+    start, startScreenShare, stop, dismissPivot,
   };
-}
-
-/* ------------------------------------------------------------------ */
-/*  Utilities                                                         */
-/* ------------------------------------------------------------------ */
-
-function getSupportedAudioMimeType() {
-  return ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find((t) => MediaRecorder.isTypeSupported(t));
-}
-
-function blobToBase64(blob: Blob) {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => resolve(String(reader.result).split(",")[1] ?? "");
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
 }
